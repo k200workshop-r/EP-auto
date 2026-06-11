@@ -141,6 +141,7 @@ def mark_teacher_status(
     status_idx = column_index(status_letter)
     ensure_column_count(df, max(name_idx, status_idx) + 1)
 
+    df.iloc[:, status_idx] = df.iloc[:, status_idx].astype(object)
     df.iloc[:, status_idx] = df.iloc[:, name_idx].map(
         lambda value: found_text
         if any(name in lookup for name in split_teacher_names(value))
@@ -296,6 +297,7 @@ def process_report(
     columns = list(report_df.columns)
     columns[ad_idx] = "課程分類"
     report_df.columns = columns
+    report_df.iloc[:, ad_idx] = report_df.iloc[:, ad_idx].astype(object)
     report_df.iloc[:, ad_idx] = ""
 
     main_mask = report_df.iloc[:, t_idx] == "授課老師有員編"
