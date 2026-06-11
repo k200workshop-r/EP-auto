@@ -2,39 +2,48 @@ from __future__ import annotations
 
 import io
 import re
+from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+
+TEMPLATE_HEADERS = [
+    "#", "課程代碼", "學年度", "醫院別", "開課單位", "課程名稱", "課程類型", "排除重複課程",
+    "上課時間", "開始日期", "結束日期", "上課時間", "上課分鐘數", "表單發送時間", "課程分類", "課程備註",
+    "上課地點", "該課程授課老師為住院醫師", "授課老師", "授課老師員編", "協同老師", "協同老師員編",
+    "該課程協同&授課老師皆為同一位住院醫師", "學生", "輔助教材", "職類", "計畫類別", "訓練計畫", "訓練科室", None,
+]
+
+DEFAULT_WIDTHS = {
+    1: 20, 25: 50, 26: 20,
+}
 
 
 @dataclass(frozen=True)
 class ColumnSettings:
     main_teacher_name: str = "S"
-    main_teacher_status: str = "T"
     co_teacher_name: str = "U"
-    co_teacher_status: str = "V"
 
     def normalized(self) -> "ColumnSettings":
         return ColumnSettings(
-            main_teacher_name=clean_column_letter(self.main_teacher_name),
-            main_teacher_status=clean_column_letter(self.main_teacher_status),
-            co_teacher_name=clean_column_letter(self.co_teacher_name),
-            co_teacher_status=clean_column_letter(self.co_teacher_status),
+            main_teacher_name=self.main_teacher_name.strip().upper(),
+            co_teacher_name=self.co_teacher_name.strip().upper(),
         )
-
-
-def clean_column_letter(letter: str) -> str:
-    cleaned = str(letter).strip().upper()
-    if not re.fullmatch(r"[A-Z]+", cleaned):
-        raise ValueError(f"欄位代號不正確：{letter}")
-    return cleaned
 
 
 def column_index(letter: str) -> int:
     value = 0
-    for char in clean_column_letter(letter):
+    cleaned = str(letter).strip().upper()
+    if not re.fullmatch(r"[A-Z]+", cleaned):
+        raise ValueError(f"欄位代號不正確：{letter}")
+    for char in cleaned:
         value = value * 26 + (ord(char) - ord("A") + 1)
     return value - 1
 
@@ -55,7 +64,12 @@ def normalize_value(value: object) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
-    return "" if text.lower() == "nan" else text
+    if text.lower() == "nan":
+        return ""
+    # 避免 Excel 員編 223004.0 這種浮點尾巴
+    if re.fullmatch(r"\d+\.0", text):
+        return text[:-2]
+    return text
 
 
 def split_teacher_names(value: object) -> list[str]:
@@ -63,84 +77,44 @@ def split_teacher_names(value: object) -> list[str]:
     if not text:
         return []
     parts = re.split(r"[、,，;；/／\n\r]+", text)
-    return [name for part in parts if (name := normalize_name(part))]
+    return [normalize_name(part) for part in parts if normalize_name(part)]
 
 
-def first_matching_column(
-    columns: Iterable[object],
-    keywords: tuple[str, ...],
-) -> object | None:
+def first_matching_column(columns: Iterable[object], keywords: tuple[str, ...]) -> object | None:
     normalized = [(column, normalize_name(column)) for column in columns]
-
     for keyword in keywords:
         key = normalize_name(keyword)
         for column, column_name in normalized:
             if column_name == key:
                 return column
-
     for keyword in keywords:
         key = normalize_name(keyword)
         for column, column_name in normalized:
-            if key in column_name:
+            if key and key in column_name:
                 return column
-
     return None
 
 
 def find_column_index_by_keywords(df: pd.DataFrame, keywords: tuple[str, ...]) -> int | None:
     normalized_columns = [normalize_name(column) for column in df.columns]
-
     for keyword in keywords:
         key = normalize_name(keyword)
         for index, column_name in enumerate(normalized_columns):
             if column_name == key:
                 return index
-
     for keyword in keywords:
         key = normalize_name(keyword)
         for index, column_name in enumerate(normalized_columns):
-            if key in column_name:
+            if key and key in column_name:
                 return index
-
     return None
 
 
-def unique_column_name(df: pd.DataFrame, base_name: str) -> str:
-    if base_name not in df.columns:
-        return base_name
-
-    suffix = 2
-    while f"{base_name}_{suffix}" in df.columns:
-        suffix += 1
-    return f"{base_name}_{suffix}"
-
-
-def rename_column_by_index(df: pd.DataFrame, index: int, new_name: str) -> None:
-    columns = list(df.columns)
-    old_name = columns[index]
-
-    if old_name == new_name:
-        return
-
-    if new_name in columns:
-        new_name = unique_column_name(df, new_name)
-
-    columns[index] = new_name
-    df.columns = columns
-
-
 def build_teacher_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
-    name_col = first_matching_column(
-        mapping_df.columns,
-        ("教師姓名", "老師姓名", "姓名", "授課老師", "協同老師"),
-    )
-    employee_col = first_matching_column(
-        mapping_df.columns,
-        ("員編", "員工編號", "教師員編", "醫師員編", "住院醫師員編", "職編", "ID"),
-    )
-
+    name_col = first_matching_column(mapping_df.columns, ("中文姓名", "教師姓名", "老師姓名", "姓名", "授課老師", "協同老師"))
+    employee_col = first_matching_column(mapping_df.columns, ("員工編號", "員編", "教師員編", "醫師員編", "住院醫師員編", "職編", "ID"))
     if name_col is None or employee_col is None:
-        raise ValueError("住院醫師名單需包含姓名欄位與員編欄位，例如「姓名」與「員編」。")
+        raise ValueError("比對用住院醫師名單需包含姓名欄位與員編欄位，例如「中文姓名」與「員工編號」。")
 
     lookup: dict[str, str] = {}
     for _, row in mapping_df.iterrows():
@@ -148,241 +122,275 @@ def build_teacher_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
         employee_id = normalize_value(row[employee_col])
         if name and employee_id:
             lookup[name] = employee_id
-
     return lookup
 
 
-def teacher_ids_for_value(value: object, lookup: dict[str, str]) -> str:
-    employee_ids = [lookup[name] for name in split_teacher_names(value) if name in lookup]
-    return "、".join(employee_ids)
+def ids_for_names(value: object, lookup: dict[str, str]) -> str:
+    ids = []
+    for name in split_teacher_names(value):
+        emp_id = lookup.get(name)
+        if emp_id and emp_id not in ids:
+            ids.append(emp_id)
+    return "、".join(ids)
 
 
-def mark_teacher_status(
-    df: pd.DataFrame,
-    lookup: dict[str, str],
-    name_letter: str,
-    status_letter: str,
-    found_text: str,
-) -> None:
-    name_idx = column_index(name_letter)
-    status_idx = column_index(status_letter)
-    ensure_column_count(df, max(name_idx, status_idx) + 1)
-
-    status_col = df.columns[status_idx]
-    values = df.iloc[:, name_idx].map(
-        lambda value: found_text if any(name in lookup for name in split_teacher_names(value)) else ""
-    ).astype(object)
-
-    # 避免原本空白欄被 pandas 判定為 float64，導致字串寫入失敗。
-    df[status_col] = values
+def unique_column_name(df: pd.DataFrame, base_name: str) -> str:
+    if base_name not in df.columns:
+        return base_name
+    suffix = 2
+    while f"{base_name}_{suffix}" in df.columns:
+        suffix += 1
+    return f"{base_name}_{suffix}"
 
 
-def split_multi_co_teacher_rows(
-    df: pd.DataFrame,
-    lookup: dict[str, str],
-    settings: ColumnSettings,
-) -> pd.DataFrame:
-    main_teacher_idx = find_column_index_by_keywords(
-        df,
-        ("授課老師", "授課教師", "主授課老師"),
-    )
-    co_teacher_idx = find_column_index_by_keywords(
-        df,
-        ("協同老師", "協同教師", "協同授課老師"),
-    )
+def split_multi_co_teacher_rows(df: pd.DataFrame, lookup: dict[str, str], settings: ColumnSettings) -> pd.DataFrame:
+    main_idx = find_column_index_by_keywords(df, ("授課老師", "授課教師", "主授課老師"))
+    co_idx = find_column_index_by_keywords(df, ("協同老師", "協同教師", "協同授課老師"))
+    if main_idx is None:
+        main_idx = column_index(settings.main_teacher_name)
+    if co_idx is None:
+        co_idx = column_index(settings.co_teacher_name)
+    ensure_column_count(df, max(main_idx, co_idx, column_index("U")) + 1)
 
-    if main_teacher_idx is None:
-        main_teacher_idx = column_index(settings.main_teacher_name)
-    if co_teacher_idx is None:
-        co_teacher_idx = column_index(settings.co_teacher_name)
-
-    ensure_column_count(df, max(main_teacher_idx, co_teacher_idx, column_index("T")) + 1)
-
-    output_rows = []
+    rows = []
     for _, row in df.iterrows():
-        main_teacher_names = split_teacher_names(row.iloc[main_teacher_idx])
-        co_teacher_names = split_teacher_names(row.iloc[co_teacher_idx])
-        main_teacher_is_resident = any(name in lookup for name in main_teacher_names)
+        main_ids = ids_for_names(row.iloc[main_idx], lookup)
+        co_names = split_teacher_names(row.iloc[co_idx])
+        co_resident_names = [name for name in co_names if name in lookup]
 
-        if len(co_teacher_names) < 2:
-            co_teacher_is_resident = any(name in lookup for name in co_teacher_names)
-            if main_teacher_is_resident or co_teacher_is_resident:
-                output_rows.append(row.copy())
+        if len(co_names) <= 1:
+            # 只保留與住院醫師相關的課程；若需要保留全部，請拿掉這個 if。
+            if main_ids or co_resident_names:
+                rows.append(row.copy())
             continue
 
-        for index, co_teacher_name in enumerate(co_teacher_names):
-            co_teacher_is_resident = co_teacher_name in lookup
-            if not main_teacher_is_resident and not co_teacher_is_resident:
+        for idx, co_name in enumerate(co_names):
+            if not main_ids and co_name not in lookup:
                 continue
-
             new_row = row.copy()
-            new_row.iloc[co_teacher_idx] = co_teacher_name
-
-            if index > 0:
+            new_row.iloc[co_idx] = co_name
+            # 第 2 位以後協同老師拆列時，清除 R/S/T，避免重複計算主授課老師。
+            if idx > 0:
                 for letter in ("R", "S", "T"):
                     col_idx = column_index(letter)
                     if col_idx < len(new_row):
                         new_row.iloc[col_idx] = ""
+            rows.append(new_row)
 
-            output_rows.append(new_row)
-
-    if not output_rows:
-        return df.iloc[0:0].copy().astype(object)
-
-    return pd.DataFrame(output_rows, columns=df.columns).reset_index(drop=True).astype(object)
+    if not rows:
+        return df.iloc[0:0].copy()
+    return pd.DataFrame(rows, columns=df.columns).reset_index(drop=True)
 
 
-def prepare_output_columns(
-    df: pd.DataFrame,
-    lookup: dict[str, str],
-    settings: ColumnSettings,
-) -> pd.DataFrame:
-    result_df = df.copy()
+def get_series_by_template_header(df: pd.DataFrame, header: str | None, used: set[int]) -> pd.Series:
+    if header is None:
+        return pd.Series([""] * len(df), dtype=object)
 
-    old_id_col = "協同老師員編(使用vlookup比對)"
-    if old_id_col in result_df.columns:
-        result_df = result_df.drop(columns=[old_id_col])
+    normalized_header = normalize_name(header)
+    for idx, col in enumerate(df.columns):
+        if idx not in used and normalize_name(col) == normalized_header:
+            used.add(idx)
+            return df.iloc[:, idx]
 
-    co_teacher_idx = find_column_index_by_keywords(
-        result_df,
-        ("協同老師", "協同教師", "協同授課老師"),
-    )
-    if co_teacher_idx is None:
-        co_teacher_idx = column_index(settings.co_teacher_name)
-        ensure_column_count(result_df, co_teacher_idx + 1)
+    # Excel 讀取重複欄名時，第 2 個「上課時間」常變成「上課時間.1」
+    for idx, col in enumerate(df.columns):
+        clean_col = re.sub(r"\.\d+$", "", normalize_name(col))
+        if idx not in used and clean_col == normalized_header:
+            used.add(idx)
+            return df.iloc[:, idx]
 
-    co_teacher_col = result_df.columns[co_teacher_idx]
-    co_teacher_ids = result_df[co_teacher_col].map(lambda value: teacher_ids_for_value(value, lookup))
-
-    result_df.insert(co_teacher_idx + 1, old_id_col, co_teacher_ids)
-
-    drop_columns = [
-        column
-        for column in result_df.columns
-        if normalize_name(column) in {"建課日期", "課程備註"}
-    ]
-    if drop_columns:
-        result_df = result_df.drop(columns=drop_columns)
-
-    return result_df
+    return pd.Series([""] * len(df), dtype=object)
 
 
-def process_report(
-    report_file,
-    mapping_file,
-    settings: ColumnSettings,
-) -> tuple[io.BytesIO, int, int]:
+def build_course_total(report_df: pd.DataFrame, lookup: dict[str, str], settings: ColumnSettings) -> pd.DataFrame:
     settings = settings.normalized()
-
-    report_df = pd.read_excel(report_file, dtype=object, engine="openpyxl").astype(object)
-    mapping_df = pd.read_excel(mapping_file, dtype=object, engine="openpyxl").astype(object)
-
     ensure_column_count(report_df, column_index("AD") + 1)
-    original_rows = len(report_df)
 
     i_idx = column_index("I")
     q_idx = column_index("Q")
     s_idx = column_index("S")
     dedupe_col = unique_column_name(report_df, "排除重複課程")
-
     report_df[dedupe_col] = (
-        report_df.iloc[:, i_idx].map(normalize_value)
-        + "|"
-        + report_df.iloc[:, q_idx].map(normalize_value)
-        + "|"
-        + report_df.iloc[:, s_idx].map(normalize_value)
+        report_df.iloc[:, i_idx].map(normalize_value) + "|" +
+        report_df.iloc[:, q_idx].map(normalize_value) + "|" +
+        report_df.iloc[:, s_idx].map(normalize_value)
     )
     report_df = report_df.drop_duplicates(subset=[dedupe_col], keep="first").reset_index(drop=True)
-
-    lookup = build_teacher_lookup(mapping_df)
     report_df = split_multi_co_teacher_rows(report_df, lookup, settings)
 
-    mark_teacher_status(
-        report_df,
-        lookup,
-        settings.main_teacher_name,
-        settings.main_teacher_status,
-        "授課老師有員編",
+    main_idx = find_column_index_by_keywords(report_df, ("授課老師", "授課教師", "主授課老師"))
+    co_idx = find_column_index_by_keywords(report_df, ("協同老師", "協同教師", "協同授課老師"))
+    if main_idx is None:
+        main_idx = column_index(settings.main_teacher_name)
+    if co_idx is None:
+        co_idx = column_index(settings.co_teacher_name)
+    ensure_column_count(report_df, max(main_idx, co_idx, column_index("AD")) + 1)
+
+    used: set[int] = set()
+    output = pd.DataFrame()
+    for header in TEMPLATE_HEADERS:
+        label = header if header is not None else ""
+        output[label] = get_series_by_template_header(report_df, header, used).map(normalize_value)
+
+    # 重新依完成版邏輯產出指定欄位
+    output["#"] = range(1, len(output) + 1)
+    output["排除重複課程"] = report_df[dedupe_col].map(normalize_value).str.replace("|", "", regex=False)
+    output["授課老師"] = report_df.iloc[:, main_idx].map(normalize_value)
+    output["協同老師"] = report_df.iloc[:, co_idx].map(normalize_value)
+    output["授課老師員編"] = output["授課老師"].map(lambda value: ids_for_names(value, lookup))
+    output["協同老師員編"] = output["協同老師"].map(lambda value: ids_for_names(value, lookup))
+    output["該課程授課老師為住院醫師"] = output["授課老師員編"]
+    output["該課程協同&授課老師皆為同一位住院醫師"] = output.apply(
+        lambda row: "是" if row["授課老師員編"] and row["授課老師員編"] == row["協同老師員編"] else "否",
+        axis=1,
     )
-    mark_teacher_status(
-        report_df,
-        lookup,
-        settings.co_teacher_name,
-        settings.co_teacher_status,
-        "協同老師有員編",
+    return output
+
+
+def build_summary(course_total: pd.DataFrame) -> pd.DataFrame:
+    mask = (
+        course_total["該課程授課老師為住院醫師"].map(normalize_value).ne("") |
+        course_total["協同老師員編"].map(normalize_value).ne("")
     )
+    summary = course_total.loc[mask].copy().reset_index(drop=True)
+    summary["#"] = range(1, len(summary) + 1)
+    return summary
 
-    ad_idx = column_index("AD")
-    t_idx = column_index(settings.main_teacher_status)
-    v_idx = column_index(settings.co_teacher_status)
-    ensure_column_count(report_df, max(ad_idx, t_idx, v_idx) + 1)
 
-    rename_column_by_index(report_df, ad_idx, "課程分類")
-    class_col = report_df.columns[ad_idx]
-    report_df[class_col] = pd.Series([""] * len(report_df), index=report_df.index, dtype=object)
+def copy_sheet_layout_from_template(template_ws, target_ws, max_rows: int, max_cols: int) -> None:
+    for row in range(1, max_rows + 1):
+        target_ws.row_dimensions[row].height = template_ws.row_dimensions[row].height
+    for col in range(1, max_cols + 1):
+        letter = get_column_letter(col)
+        target_ws.column_dimensions[letter].width = template_ws.column_dimensions[letter].width
 
-    main_mask = report_df.iloc[:, t_idx] == "授課老師有員編"
-    co_mask = (report_df[class_col] == "") & (report_df.iloc[:, v_idx] == "協同老師有員編")
+    style_source_row = 2 if template_ws.max_row >= 2 else 1
+    for col in range(1, max_cols + 1):
+        src = template_ws.cell(1, col)
+        dst = target_ws.cell(1, col)
+        dst.font = copy(src.font)
+        dst.fill = copy(src.fill)
+        dst.border = copy(src.border)
+        dst.alignment = copy(src.alignment)
+        dst.number_format = src.number_format
 
-    report_df.loc[main_mask, class_col] = "A.住院醫師主授課程"
-    report_df.loc[co_mask, class_col] = "B.住院醫師擔任協同老師"
+        src_body = template_ws.cell(style_source_row, col)
+        for row in range(2, max_rows + 1):
+            dst_body = target_ws.cell(row, col)
+            dst_body.font = copy(src_body.font)
+            dst_body.fill = copy(src_body.fill)
+            dst_body.border = copy(src_body.border)
+            dst_body.alignment = copy(src_body.alignment)
+            dst_body.number_format = src_body.number_format
 
-    report_df = prepare_output_columns(report_df, lookup, settings)
+
+def apply_default_layout(ws, max_rows: int, max_cols: int, summary: bool = False) -> None:
+    header_fill = PatternFill("solid", fgColor="CCCCCC")
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for col in range(1, max_cols + 1):
+        letter = get_column_letter(col)
+        ws.column_dimensions[letter].width = DEFAULT_WIDTHS.get(col, 13)
+    ws.row_dimensions[1].height = 72 if summary else 43.2
+    for row in range(1, max_rows + 1):
+        for col in range(1, max_cols + 1):
+            cell = ws.cell(row, col)
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if row == 1:
+                cell.fill = header_fill
+                cell.font = Font(name="Calibri", size=11, color="000000")
+
+
+def write_dataframe(ws, df: pd.DataFrame) -> None:
+    for c, col_name in enumerate(df.columns, 1):
+        ws.cell(1, c).value = col_name
+    for r, row in enumerate(df.itertuples(index=False, name=None), 2):
+        for c, value in enumerate(row, 1):
+            ws.cell(r, c).value = None if pd.isna(value) or value == "" else value
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{max(len(df) + 1, 1)}"
+
+
+def create_output_workbook(course_total: pd.DataFrame, summary: pd.DataFrame, mapping_df: pd.DataFrame, template_file=None) -> io.BytesIO:
+    template_wb = None
+    if template_file is not None:
+        template_wb = load_workbook(template_file)
+    elif Path("115年6月RAST.xlsx").exists():
+        template_wb = load_workbook("115年6月RAST.xlsx")
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    for sheet_name, df in (("課程總表", course_total), ("彙整", summary)):
+        ws = wb.create_sheet(sheet_name)
+        write_dataframe(ws, df)
+        max_rows = len(df) + 1
+        max_cols = len(df.columns)
+        if template_wb and sheet_name in template_wb.sheetnames:
+            copy_sheet_layout_from_template(template_wb[sheet_name], ws, max_rows, max_cols)
+        else:
+            apply_default_layout(ws, max_rows, max_cols, summary=(sheet_name == "彙整"))
+
+    ws_map = wb.create_sheet("比對用")
+    mapping_output = mapping_df.copy().map(normalize_value)
+    write_dataframe(ws_map, mapping_output)
+    if template_wb and "比對用" in template_wb.sheetnames:
+        copy_sheet_layout_from_template(template_wb["比對用"], ws_map, len(mapping_output) + 1, len(mapping_output.columns))
+    else:
+        for col in range(1, len(mapping_output.columns) + 1):
+            ws_map.column_dimensions[get_column_letter(col)].width = 18
+            ws_map.cell(1, col).font = Font(bold=True)
+            ws_map.cell(1, col).alignment = Alignment(horizontal="center")
 
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        report_df.to_excel(writer, index=False, sheet_name="整理後報表")
+    wb.save(output)
     output.seek(0)
+    return output
 
-    return output, original_rows, len(report_df)
+
+def process_report(report_file, mapping_file, settings: ColumnSettings, template_file=None) -> tuple[io.BytesIO, int, int, int]:
+    report_df = pd.read_excel(report_file, dtype=object, engine="openpyxl").astype(object)
+    mapping_df = pd.read_excel(mapping_file, dtype=object, engine="openpyxl").astype(object)
+    original_rows = len(report_df)
+    lookup = build_teacher_lookup(mapping_df)
+    course_total = build_course_total(report_df, lookup, settings)
+    summary = build_summary(course_total)
+    output = create_output_workbook(course_total, summary, mapping_df, template_file)
+    return output, original_rows, len(course_total), len(summary)
 
 
-st.set_page_config(
-    page_title="EP 課程報表整理",
-    layout="centered",
-)
-
-st.title("EP 課程報表整理")
-st.caption("上傳原始版報表與比對用住院醫師名單，自動去重、拆分協同老師、比對員編並完成課程分類。")
+st.set_page_config(page_title="EP/RAST 課程報表整理", layout="centered")
+st.title("EP/RAST 課程報表整理")
+st.caption("上傳原始版報表與比對用住院醫師名單，輸出格式會比照完成版：課程總表、彙整、比對用。")
 
 report_file = st.file_uploader("上傳原始版 Excel 報表", type=["xlsx"])
 mapping_file = st.file_uploader("上傳比對用住院醫師名單", type=["xlsx"])
+template_file = st.file_uploader("上傳完成版樣板（選填；若要完全複製排版請上傳 115年6月RAST.xlsx）", type=["xlsx"])
 
 with st.expander("欄位設定"):
     left, right = st.columns(2)
-
     with left:
         main_teacher_name = st.text_input("授課老師姓名欄", value="S")
-        co_teacher_name = st.text_input("協同老師姓名欄", value="U")
-
     with right:
-        main_teacher_status = st.text_input("授課老師比對結果欄", value="T")
-        co_teacher_status = st.text_input("協同老師比對結果欄", value="V")
+        co_teacher_name = st.text_input("協同老師姓名欄", value="U")
 
 if st.button("整理報表", type="primary"):
     if report_file is None or mapping_file is None:
         st.error("請同時上傳原始版 Excel 報表與比對用住院醫師名單。")
     else:
         try:
-            output, original_rows, final_rows = process_report(
+            output, original_rows, total_rows, summary_rows = process_report(
                 report_file,
                 mapping_file,
-                ColumnSettings(
-                    main_teacher_name=main_teacher_name,
-                    main_teacher_status=main_teacher_status,
-                    co_teacher_name=co_teacher_name,
-                    co_teacher_status=co_teacher_status,
-                ),
+                ColumnSettings(main_teacher_name=main_teacher_name, co_teacher_name=co_teacher_name),
+                template_file=template_file,
             )
-
-            st.success(f"整理完成：原始 {original_rows} 筆，輸出 {final_rows} 筆。")
-
+            st.success(f"整理完成：原始 {original_rows} 筆，課程總表 {total_rows} 筆，彙整 {summary_rows} 筆。")
             st.download_button(
                 "下載整理後 Excel",
                 data=output,
-                file_name=f"整理後報表_原{original_rows}筆_輸出{final_rows}筆.xlsx",
+                file_name=f"整理後RAST報表_總表{total_rows}筆_彙整{summary_rows}筆.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
         except Exception as exc:
             st.error(f"處理失敗：{exc}")
