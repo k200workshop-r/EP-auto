@@ -80,10 +80,21 @@ def first_matching_column(
 
 
 def find_column_index_by_keywords(df: pd.DataFrame, keywords: tuple[str, ...]) -> int | None:
-    matched_column = first_matching_column(df.columns, keywords)
-    if matched_column is None:
-        return None
-    return df.columns.get_loc(matched_column)
+    normalized_columns = [normalize_name(column) for column in df.columns]
+
+    for keyword in keywords:
+        key = normalize_name(keyword)
+        for index, column_name in enumerate(normalized_columns):
+            if column_name == key:
+                return index
+
+    for keyword in keywords:
+        key = normalize_name(keyword)
+        for index, column_name in enumerate(normalized_columns):
+            if key in column_name:
+                return index
+
+    return None
 
 
 def unique_column_name(df: pd.DataFrame, base_name: str) -> str:
@@ -251,6 +262,8 @@ def process_report(
 ) -> tuple[io.BytesIO, int, int]:
     report_df = pd.read_excel(report_file, dtype=object, engine="openpyxl")
     mapping_df = pd.read_excel(mapping_file, dtype=object, engine="openpyxl")
+    report_df = report_df.astype(object)
+    mapping_df = mapping_df.astype(object)
 
     ensure_column_count(report_df, column_index("AD") + 1)
     original_rows = len(report_df)
