@@ -168,9 +168,13 @@ def mark_teacher_status(
     status_idx = column_index(status_letter)
     ensure_column_count(df, max(name_idx, status_idx) + 1)
 
-    df.iloc[:, status_idx] = df.iloc[:, name_idx].map(
+    status_col = df.columns[status_idx]
+    values = df.iloc[:, name_idx].map(
         lambda value: found_text if any(name in lookup for name in split_teacher_names(value)) else ""
-    )
+    ).astype(object)
+
+    # 避免原本空白欄被 pandas 判定為 float64，導致字串寫入失敗。
+    df[status_col] = values
 
 
 def split_multi_co_teacher_rows(
@@ -216,14 +220,16 @@ def split_multi_co_teacher_rows(
 
             if index > 0:
                 for letter in ("R", "S", "T"):
-                    new_row.iloc[column_index(letter)] = ""
+                    col_idx = column_index(letter)
+                    if col_idx < len(new_row):
+                        new_row.iloc[col_idx] = ""
 
             output_rows.append(new_row)
 
     if not output_rows:
-        return df.iloc[0:0].copy()
+        return df.iloc[0:0].copy().astype(object)
 
-    return pd.DataFrame(output_rows, columns=df.columns).reset_index(drop=True)
+    return pd.DataFrame(output_rows, columns=df.columns).reset_index(drop=True).astype(object)
 
 
 def prepare_output_columns(
@@ -312,13 +318,14 @@ def process_report(
     ensure_column_count(report_df, max(ad_idx, t_idx, v_idx) + 1)
 
     rename_column_by_index(report_df, ad_idx, "課程分類")
-    report_df.iloc[:, ad_idx] = ""
+    class_col = report_df.columns[ad_idx]
+    report_df[class_col] = pd.Series([""] * len(report_df), index=report_df.index, dtype=object)
 
     main_mask = report_df.iloc[:, t_idx] == "授課老師有員編"
-    co_mask = (report_df.iloc[:, ad_idx] == "") & (report_df.iloc[:, v_idx] == "協同老師有員編")
+    co_mask = (report_df[class_col] == "") & (report_df.iloc[:, v_idx] == "協同老師有員編")
 
-    report_df.loc[main_mask, report_df.columns[ad_idx]] = "A.住院醫師主授課程"
-    report_df.loc[co_mask, report_df.columns[ad_idx]] = "B.住院醫師擔任協同老師"
+    report_df.loc[main_mask, class_col] = "A.住院醫師主授課程"
+    report_df.loc[co_mask, class_col] = "B.住院醫師擔任協同老師"
 
     report_df = prepare_output_columns(report_df, lookup, settings)
 
