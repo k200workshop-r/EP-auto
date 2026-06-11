@@ -16,16 +16,26 @@ class ColumnSettings:
     co_teacher_name: str = "U"
     co_teacher_status: str = "V"
 
+    def normalized(self) -> "ColumnSettings":
+        return ColumnSettings(
+            main_teacher_name=clean_column_letter(self.main_teacher_name),
+            main_teacher_status=clean_column_letter(self.main_teacher_status),
+            co_teacher_name=clean_column_letter(self.co_teacher_name),
+            co_teacher_status=clean_column_letter(self.co_teacher_status),
+        )
+
+
+def clean_column_letter(letter: str) -> str:
+    cleaned = str(letter).strip().upper()
+    if not re.fullmatch(r"[A-Z]+", cleaned):
+        raise ValueError(f"欄位代號不正確：{letter}")
+    return cleaned
+
 
 def column_index(letter: str) -> int:
     value = 0
-    cleaned = letter.strip().upper()
-    if not re.fullmatch(r"[A-Z]+", cleaned):
-        raise ValueError(f"欄位代號不正確：{letter}")
-
-    for char in cleaned:
+    for char in clean_column_letter(letter):
         value = value * 26 + (ord(char) - ord("A") + 1)
-
     return value - 1
 
 
@@ -44,7 +54,6 @@ def normalize_name(value: object) -> str:
 def normalize_value(value: object) -> str:
     if pd.isna(value):
         return ""
-
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
 
@@ -53,9 +62,8 @@ def split_teacher_names(value: object) -> list[str]:
     text = normalize_value(value)
     if not text:
         return []
-
     parts = re.split(r"[、,，;；/／\n\r]+", text)
-    return [normalize_name(part) for part in parts if normalize_name(part)]
+    return [name for part in parts if (name := normalize_name(part))]
 
 
 def first_matching_column(
@@ -104,8 +112,21 @@ def unique_column_name(df: pd.DataFrame, base_name: str) -> str:
     suffix = 2
     while f"{base_name}_{suffix}" in df.columns:
         suffix += 1
-
     return f"{base_name}_{suffix}"
+
+
+def rename_column_by_index(df: pd.DataFrame, index: int, new_name: str) -> None:
+    columns = list(df.columns)
+    old_name = columns[index]
+
+    if old_name == new_name:
+        return
+
+    if new_name in columns:
+        new_name = unique_column_name(df, new_name)
+
+    columns[index] = new_name
+    df.columns = columns
 
 
 def build_teacher_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
@@ -125,7 +146,6 @@ def build_teacher_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
     for _, row in mapping_df.iterrows():
         name = normalize_name(row[name_col])
         employee_id = normalize_value(row[employee_col])
-
         if name and employee_id:
             lookup[name] = employee_id
 
@@ -133,11 +153,7 @@ def build_teacher_lookup(mapping_df: pd.DataFrame) -> dict[str, str]:
 
 
 def teacher_ids_for_value(value: object, lookup: dict[str, str]) -> str:
-    employee_ids = [
-        lookup[name]
-        for name in split_teacher_names(value)
-        if name in lookup
-    ]
+    employee_ids = [lookup[name] for name in split_teacher_names(value) if name in lookup]
     return "、".join(employee_ids)
 
 
@@ -152,11 +168,8 @@ def mark_teacher_status(
     status_idx = column_index(status_letter)
     ensure_column_count(df, max(name_idx, status_idx) + 1)
 
-    df.iloc[:, status_idx] = df.iloc[:, status_idx].astype(object)
     df.iloc[:, status_idx] = df.iloc[:, name_idx].map(
-        lambda value: found_text
-        if any(name in lookup for name in split_teacher_names(value))
-        else ""
+        lambda value: found_text if any(name in lookup for name in split_teacher_names(value)) else ""
     )
 
 
@@ -179,10 +192,7 @@ def split_multi_co_teacher_rows(
     if co_teacher_idx is None:
         co_teacher_idx = column_index(settings.co_teacher_name)
 
-    ensure_column_count(
-        df,
-        max(main_teacher_idx, co_teacher_idx, column_index("T")) + 1,
-    )
+    ensure_column_count(df, max(main_teacher_idx, co_teacher_idx, column_index("T")) + 1)
 
     output_rows = []
     for _, row in df.iterrows():
@@ -223,26 +233,22 @@ def prepare_output_columns(
 ) -> pd.DataFrame:
     result_df = df.copy()
 
+    old_id_col = "協同老師員編(使用vlookup比對)"
+    if old_id_col in result_df.columns:
+        result_df = result_df.drop(columns=[old_id_col])
+
     co_teacher_idx = find_column_index_by_keywords(
         result_df,
         ("協同老師", "協同教師", "協同授課老師"),
     )
     if co_teacher_idx is None:
         co_teacher_idx = column_index(settings.co_teacher_name)
-
-    if "協同老師員編(使用vlookup比對)" in result_df.columns:
-        result_df = result_df.drop(columns=["協同老師員編(使用vlookup比對)"])
-        co_teacher_idx = min(co_teacher_idx, len(result_df.columns) - 1)
+        ensure_column_count(result_df, co_teacher_idx + 1)
 
     co_teacher_col = result_df.columns[co_teacher_idx]
-    co_teacher_ids = result_df[co_teacher_col].map(
-        lambda value: teacher_ids_for_value(value, lookup)
-    )
-    result_df.insert(
-        co_teacher_idx + 1,
-        "協同老師員編(使用vlookup比對)",
-        co_teacher_ids,
-    )
+    co_teacher_ids = result_df[co_teacher_col].map(lambda value: teacher_ids_for_value(value, lookup))
+
+    result_df.insert(co_teacher_idx + 1, old_id_col, co_teacher_ids)
 
     drop_columns = [
         column
@@ -260,10 +266,10 @@ def process_report(
     mapping_file,
     settings: ColumnSettings,
 ) -> tuple[io.BytesIO, int, int]:
-    report_df = pd.read_excel(report_file, dtype=object, engine="openpyxl")
-    mapping_df = pd.read_excel(mapping_file, dtype=object, engine="openpyxl")
-    report_df = report_df.astype(object)
-    mapping_df = mapping_df.astype(object)
+    settings = settings.normalized()
+
+    report_df = pd.read_excel(report_file, dtype=object, engine="openpyxl").astype(object)
+    mapping_df = pd.read_excel(mapping_file, dtype=object, engine="openpyxl").astype(object)
 
     ensure_column_count(report_df, column_index("AD") + 1)
     original_rows = len(report_df)
@@ -280,10 +286,7 @@ def process_report(
         + "|"
         + report_df.iloc[:, s_idx].map(normalize_value)
     )
-    report_df = report_df.drop_duplicates(
-        subset=[dedupe_col],
-        keep="first",
-    ).reset_index(drop=True)
+    report_df = report_df.drop_duplicates(subset=[dedupe_col], keep="first").reset_index(drop=True)
 
     lookup = build_teacher_lookup(mapping_df)
     report_df = split_multi_co_teacher_rows(report_df, lookup, settings)
@@ -306,20 +309,16 @@ def process_report(
     ad_idx = column_index("AD")
     t_idx = column_index(settings.main_teacher_status)
     v_idx = column_index(settings.co_teacher_status)
+    ensure_column_count(report_df, max(ad_idx, t_idx, v_idx) + 1)
 
-    columns = list(report_df.columns)
-    columns[ad_idx] = "課程分類"
-    report_df.columns = columns
-    report_df.iloc[:, ad_idx] = report_df.iloc[:, ad_idx].astype(object)
+    rename_column_by_index(report_df, ad_idx, "課程分類")
     report_df.iloc[:, ad_idx] = ""
 
     main_mask = report_df.iloc[:, t_idx] == "授課老師有員編"
-    co_mask = (
-        (report_df.iloc[:, ad_idx] == "")
-        & (report_df.iloc[:, v_idx] == "協同老師有員編")
-    )
-    report_df.iloc[main_mask.to_numpy(), ad_idx] = "A.住院醫師主授課程"
-    report_df.iloc[co_mask.to_numpy(), ad_idx] = "B.住院醫師擔任協同老師"
+    co_mask = (report_df.iloc[:, ad_idx] == "") & (report_df.iloc[:, v_idx] == "協同老師有員編")
+
+    report_df.loc[main_mask, report_df.columns[ad_idx]] = "A.住院醫師主授課程"
+    report_df.loc[co_mask, report_df.columns[ad_idx]] = "B.住院醫師擔任協同老師"
 
     report_df = prepare_output_columns(report_df, lookup, settings)
 
