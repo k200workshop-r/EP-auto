@@ -144,42 +144,14 @@ def unique_column_name(df: pd.DataFrame, base_name: str) -> str:
 
 
 def split_multi_co_teacher_rows(df: pd.DataFrame, lookup: dict[str, str], settings: ColumnSettings) -> pd.DataFrame:
-    main_idx = find_column_index_by_keywords(df, ("授課老師", "授課教師", "主授課老師"))
-    co_idx = find_column_index_by_keywords(df, ("協同老師", "協同教師", "協同授課老師"))
-    if main_idx is None:
-        main_idx = column_index(settings.main_teacher_name)
-    if co_idx is None:
-        co_idx = column_index(settings.co_teacher_name)
-    ensure_column_count(df, max(main_idx, co_idx, column_index("U")) + 1)
+    """
+    保留相容用函式。
 
-    rows = []
-    for _, row in df.iterrows():
-        main_ids = ids_for_names(row.iloc[main_idx], lookup)
-        co_names = split_teacher_names(row.iloc[co_idx])
-        co_resident_names = [name for name in co_names if name in lookup]
-
-        if len(co_names) <= 1:
-            # 只保留與住院醫師相關的課程；若需要保留全部，請拿掉這個 if。
-            if main_ids or co_resident_names:
-                rows.append(row.copy())
-            continue
-
-        for idx, co_name in enumerate(co_names):
-            if not main_ids and co_name not in lookup:
-                continue
-            new_row = row.copy()
-            new_row.iloc[co_idx] = co_name
-            # 第 2 位以後協同老師拆列時，清除 R/S/T，避免重複計算主授課老師。
-            if idx > 0:
-                for letter in ("R", "S", "T"):
-                    col_idx = column_index(letter)
-                    if col_idx < len(new_row):
-                        new_row.iloc[col_idx] = ""
-            rows.append(new_row)
-
-    if not rows:
-        return df.iloc[0:0].copy()
-    return pd.DataFrame(rows, columns=df.columns).reset_index(drop=True)
+    v4 起「課程總表」不再拆列、不篩選、不刪除任何原始資料列，
+    因此這個函式直接回傳原資料。若未來需要另做「拆分協同老師明細表」，
+    建議新增獨立工作表，不要改動課程總表。
+    """
+    return df.copy().reset_index(drop=True)
 
 
 def get_series_by_template_header(df: pd.DataFrame, header: str | None, used: set[int]) -> pd.Series:
@@ -210,13 +182,14 @@ def build_course_total(report_df: pd.DataFrame, lookup: dict[str, str], settings
     q_idx = column_index("Q")
     s_idx = column_index("S")
     dedupe_col = unique_column_name(report_df, "排除重複課程")
+    # 只建立與 Excel 公式 I&Q&S 對應的判斷 key，不刪除任何重複列。
+    # 使用分隔符避免不同欄位組合產生相同字串，例如 AB+C 與 A+BC。
     report_df[dedupe_col] = (
         report_df.iloc[:, i_idx].map(normalize_value) + "|" +
         report_df.iloc[:, q_idx].map(normalize_value) + "|" +
         report_df.iloc[:, s_idx].map(normalize_value)
     )
-    report_df = report_df.drop_duplicates(subset=[dedupe_col], keep="first").reset_index(drop=True)
-    report_df = split_multi_co_teacher_rows(report_df, lookup, settings)
+    report_df = report_df.reset_index(drop=True)
 
     main_idx = find_column_index_by_keywords(report_df, ("授課老師", "授課教師", "主授課老師"))
     co_idx = find_column_index_by_keywords(report_df, ("協同老師", "協同教師", "協同授課老師"))
@@ -361,7 +334,7 @@ def process_report(report_file, mapping_file, settings: ColumnSettings, template
 
 st.set_page_config(page_title="EP/RAST 課程報表整理", layout="centered")
 st.title("EP/RAST 課程報表整理")
-st.caption("上傳原始版報表與比對用住院醫師名單，輸出格式會比照完成版：課程總表、彙整、比對用。")
+st.caption("上傳原始版報表與比對用住院醫師名單，輸出格式會比照完成版；課程總表會完整保留每一筆原始資料，不會去重、不會篩掉、不會拆列。")
 
 report_file = st.file_uploader("上傳原始版 Excel 報表", type=["xlsx"])
 mapping_file = st.file_uploader("上傳比對用住院醫師名單", type=["xlsx"])
@@ -385,7 +358,7 @@ if st.button("整理報表", type="primary"):
                 ColumnSettings(main_teacher_name=main_teacher_name, co_teacher_name=co_teacher_name),
                 template_file=template_file,
             )
-            st.success(f"整理完成：原始 {original_rows} 筆，課程總表 {total_rows} 筆，彙整 {summary_rows} 筆。")
+            st.success(f"整理完成：原始 {original_rows} 筆，課程總表保留 {total_rows} 筆，彙整 {summary_rows} 筆。")
             st.download_button(
                 "下載整理後 Excel",
                 data=output,
