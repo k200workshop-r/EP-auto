@@ -331,13 +331,38 @@ def write_dataframe(ws, df: pd.DataFrame) -> None:
     autosize_and_style(ws)
 
 
-def process_report(report_file, mapping_file) -> tuple[io.BytesIO, int, int, int, int]:
+def split_summary_by_category(summary_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """從彙整表另外拆出 A 類與 B 類報表，方便直接查看。"""
+    category_col = "A.住院醫師主授課程/B.住院醫師擔任協同老師"
+
+    if summary_df.empty or category_col not in summary_df.columns:
+        empty_df = pd.DataFrame(columns=summary_df.columns)
+        return empty_df.copy(), empty_df.copy()
+
+    a_df = summary_df.loc[
+        summary_df[category_col].map(normalize_value).eq("A.住院醫師主授課程")
+    ].copy()
+    b_df = summary_df.loc[
+        summary_df[category_col].map(normalize_value).eq("B.住院醫師擔任協同老師")
+    ].copy()
+
+    # 分表重新編號，避免沿用彙整中的流水號造成不連續。
+    if "#" in a_df.columns:
+        a_df.loc[:, "#"] = range(1, len(a_df) + 1)
+    if "#" in b_df.columns:
+        b_df.loc[:, "#"] = range(1, len(b_df) + 1)
+
+    return a_df.reset_index(drop=True).astype(object), b_df.reset_index(drop=True).astype(object)
+
+
+def process_report(report_file, mapping_file) -> tuple[io.BytesIO, int, int, int, int, int, int]:
     report_df = read_excel_first_sheet(report_file)
     mapping_df = read_excel_first_sheet(mapping_file)
     lookup = build_teacher_lookup(mapping_df)
 
     course_df = standardize_report(report_df, lookup, ColumnSettings())
     summary_df = build_summary(course_df)
+    a_report_df, b_report_df = split_summary_by_category(summary_df)
 
     wb = Workbook()
     ws_course = wb.active
@@ -346,6 +371,13 @@ def process_report(report_file, mapping_file) -> tuple[io.BytesIO, int, int, int
 
     ws_summary = wb.create_sheet("彙整")
     write_dataframe(ws_summary, summary_df)
+
+    # 另外列出 A 類主授課程報表與 B 類協同老師報表。
+    ws_a = wb.create_sheet("A住院醫師主授課程")
+    write_dataframe(ws_a, a_report_df)
+
+    ws_b = wb.create_sheet("B住院醫師協同老師")
+    write_dataframe(ws_b, b_report_df)
 
     ws_lookup = wb.create_sheet("比對用")
     lookup_df = pd.DataFrame([{"姓名": name, "員編": employee_id} for name, employee_id in lookup.items()])
@@ -358,7 +390,15 @@ def process_report(report_file, mapping_file) -> tuple[io.BytesIO, int, int, int
     blank_student_rows = int((course_df["符合/不符合"] == "不符合(學生空白)").sum())
     co_teacher_student_rows = int((course_df["符合/不符合"] == "不符合(協同老師同時為學生)").sum())
 
-    return output, len(course_df), len(summary_df), blank_student_rows, co_teacher_student_rows
+    return (
+        output,
+        len(course_df),
+        len(summary_df),
+        len(a_report_df),
+        len(b_report_df),
+        blank_student_rows,
+        co_teacher_student_rows,
+    )
 
 
 st.set_page_config(page_title="RAST 自動化報表", page_icon="📊", layout="centered")
@@ -375,12 +415,21 @@ if st.button("產生整理後 RAST 報表", type="primary"):
         st.error("請同時上傳原始 RAST Excel 報表與比對用住院醫師名單。")
     else:
         try:
-            output, course_rows, summary_rows, blank_student_rows, co_teacher_student_rows = process_report(
+            (
+                output,
+                course_rows,
+                summary_rows,
+                a_rows,
+                b_rows,
+                blank_student_rows,
+                co_teacher_student_rows,
+            ) = process_report(
                 report_file,
                 mapping_file,
             )
             st.success(
                 f"完成：課程總表 {course_rows} 筆；彙整 {summary_rows} 筆；"
+                f"A主授課程 {a_rows} 筆；B協同老師 {b_rows} 筆；"
                 f"學生空白未納入 {blank_student_rows} 筆；"
                 f"協同老師同時為學生未納入 {co_teacher_student_rows} 筆。"
             )
