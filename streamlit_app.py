@@ -285,7 +285,7 @@ def build_summary(course_df: pd.DataFrame) -> pd.DataFrame:
     co_mask = eligible & ~main_mask & co_is_resident
     selected_mask = main_mask | co_mask
 
-    summary_base = df.loc[selected_mask, COURSE_HEADERS[:-1]].copy()
+    summary_base = df.loc[selected_mask].iloc[:, : len(COURSE_HEADERS) - 1].copy()
     summary_base.columns = SUMMARY_HEADERS[:-1]
 
     category = pd.Series("", index=df.index, dtype=object)
